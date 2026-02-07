@@ -15,9 +15,7 @@ from src.framework.bus import EventBus
 from src.framework.registry import AgentRegistry
 from src.domain.events import VoltageSampleEvent, ProcessingResultEvent, SystemTripEvent
 from src.ui.bridge import BridgeAgent
-from simulation.fault_scenarios import BenchmarkDriver
-
-from src.framework.observability import Observability
+from simulation.advanced_scenarios import AdvancedScenarioRunner, SimulationResult # Import new runner
 
 st.set_page_config(page_title="DC Microgrid Fault Detection", layout="wide")
 
@@ -44,35 +42,46 @@ if 'data_queue' not in st.session_state:
 if 'system_status' not in st.session_state:
     st.session_state.system_status = "SAFE"
 if 'voltage_buffer' not in st.session_state:
-    st.session_state.voltage_buffer = []    
+    st.session_state.voltage_buffer = []  
+if 'last_result' not in st.session_state:
+    st.session_state.last_result = None  
 
-def run_simulation(bridge_queue):
+def run_simulation(bridge_queue, scenario_name):
     # This runs in a separate thread
-    sim = BenchmarkDriver()
+    runner = AdvancedScenarioRunner()
     
-    bridge = BridgeAgent("UI_Bridge", sim.bus)
-    bridge.queue = bridge_queue # Use the queue passed from UI
+    # Hook Bridge
+    bridge = BridgeAgent("UI_Bridge", runner.bus)
+    bridge.queue = bridge_queue 
+    runner.registry.register(bridge)
     
-    sim.registry.register(bridge)
-    
-    # Run the scenario
-    sim.run_scenario()
+    # Run in Visual Mode (Real-Time) so charts update
+    result = runner.run(scenario_name, visual_mode=True)
+    st.session_state.last_result = result
     st.session_state.simulation_running = False
 
 # Sidebar Navigation
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "System Logs"])
+page = st.sidebar.radio("Go to", ["Dashboard", "System Logs", "Benchmarking"])
 
-st.sidebar.title("Controls")
+st.sidebar.title("Simulation Control")
+scenario = st.sidebar.selectbox("Select Scenario", [
+    "Baseline (Normal)", 
+    "Line-to-Line Fault", 
+    "High Noise Stress", 
+    "Gradual Drift"
+])
+
 if st.sidebar.button("Start Simulation"):
     if not st.session_state.simulation_running:
         st.session_state.simulation_running = True
         st.session_state.system_status = "SAFE"
         st.session_state.voltage_buffer = []
         st.session_state.data_queue = queue.Queue()
+        st.session_state.last_result = None
         
-        # Start Thread
-        t = threading.Thread(target=run_simulation, args=(st.session_state.data_queue,))
+        # Start Thread with Scenario
+        t = threading.Thread(target=run_simulation, args=(st.session_state.data_queue, scenario))
         t.start()
 
 if page == "System Logs":
@@ -92,6 +101,36 @@ if page == "System Logs":
         st.code(logs_text, language="text")
     except Exception as e:
         st.error(f"Could not retrieve logs: {e}")
+
+elif page == "Benchmarking":
+    st.title("📊 Automated Benchmarking Report")
+    
+    if st.session_state.last_result:
+        res = st.session_state.last_result
+        
+        # Summary Metrics
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Scenario", res.scenario_name)
+        m2.metric("Trip Triggered", "YES" if res.trip_triggered else "NO")
+        m3.metric("Latency", f"{res.latency_ms:.4f} ms" if res.latency_ms else "N/A")
+        m4.metric("Duration", f"{res.duration_s:.2f} s")
+        
+        st.divider()
+        
+        # Detailed Findings
+        st.subheader("Analysis")
+        if res.trip_triggered:
+            if res.latency_ms < 5.0:
+                st.success(f"✅ PASSED: Fault detected in {res.latency_ms:.4f}ms (< 5ms target)")
+            else:
+                st.error(f"❌ FAILED: Detection too slow ({res.latency_ms:.4f}ms)")
+        elif res.fault_injected:
+             st.error("❌ FAILED: Fault injected but NOT detected!")
+        else:
+             st.info("ℹ️ Normal Operation - No faults injected.")
+             
+    else:
+        st.info("Run a simulation to generate a benchmark report.")
 
 else:
     # Main Dashboard Page

@@ -4,6 +4,7 @@ import time
 import uuid
 import sys
 import threading
+import collections # Fix NameError
 from typing import Dict, Any, Optional
 from datetime import datetime
 

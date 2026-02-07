@@ -3,7 +3,10 @@ from src.domain.events import SystemTripEvent
 
 class TripSequencerAgent(BaseAgent):
     def setup(self):
-        self.subscribe(SystemTripEvent, self.on_trip)
+        self.relay_driver = self.config.get('relay_driver')
+        if not self.relay_driver:
+            self.logger.warning("No Relay Driver configured!")
+        self.bus.subscribe(SystemTripEvent, self.on_trip)
 
     def set_driver(self, driver):
         self.relay_driver = driver
