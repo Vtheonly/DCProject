@@ -234,9 +234,12 @@ def start_system():
     registry = AgentRegistry()
     emulator = GridEmulator()
     
-    # Bridge events to UI queue
+    # Bridge events to UI queue - capture queue instance to avoid thread context issues
+    # We must capture the queue object itself, not access st.session_state in the thread
+    ui_queue = st.session_state.data_queue
+    
     def bridge_to_ui(event):
-        st.session_state.data_queue.put(event)
+        ui_queue.put(event)
     
     # Subscribe bridge to all relevant events
     bus.subscribe(VoltageSampleEvent, bridge_to_ui)
@@ -328,6 +331,10 @@ def process_events():
     processed = 0
     max_per_cycle = 100
     
+    # Check if data_queue exists in session state (it should)
+    if 'data_queue' not in st.session_state:
+        return
+
     while not st.session_state.data_queue.empty() and processed < max_per_cycle:
         try:
             event = st.session_state.data_queue.get_nowait()
@@ -404,10 +411,10 @@ def render_sidebar():
         st.markdown("### System Control")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("▶️ Start", use_container_width=True, type="primary"):
+            if st.button("▶️ Start", width='stretch', type="primary"):
                 start_system()
         with col2:
-            if st.button("⏹️ Stop", use_container_width=True):
+            if st.button("⏹️ Stop", width='stretch'):
                 stop_system()
         
         # Status indicator
@@ -463,10 +470,10 @@ def render_sidebar():
         
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("⚡ INJECT", use_container_width=True, type="primary"):
+            if st.button("⚡ INJECT", width='stretch', type="primary"):
                 inject_fault(fault_type, severity, location)
         with col2:
-            if st.button("🔄 CLEAR", use_container_width=True):
+            if st.button("🔄 CLEAR", width='stretch'):
                 clear_fault()
         
         # Converter Control

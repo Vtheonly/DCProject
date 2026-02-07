@@ -1,0 +1,19 @@
+{
+  "trip_event": {
+    "type": "SystemTripEvent",
+    "timestamp": 1770504316.8033876,
+    "source": "System",
+    "event_id": "5677b2a6-01dd-4b8f-85a5-d16e72b34148",
+    "payload": null,
+    "reason": "Detected by ThresholdGuard",
+    "urgency": 10,
+    "latency_ms": 0.0,
+    "snapshot_data": {}
+  },
+  "fault_start": 1770504316.8017228,
+  "trip_time": 1770504316.8033876,
+  "latency_ms": 1.664876937866211,
+  "recorded_at": "2026-02-07T23:45:16.803574",
+  "event_count": 0,
+  "events": []
+}
