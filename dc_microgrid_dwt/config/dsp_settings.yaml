@@ -1,0 +1,7 @@
+wavelet:
+  family: "db4"
+  level: 4
+  mode: "symmetric"
+sampling:
+  rate_hz: 20000
+  window_size: 128

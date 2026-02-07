@@ -1,0 +1,9 @@
+adc:
+  channel: 0
+  spi_bus: 0
+  device: 0
+relay:
+  trip_pin: 17 # GPIO 17
+  status_pin: 27
+zeta_converter:
+  pwm_pin: 18
