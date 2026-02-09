@@ -123,6 +123,7 @@ class FaultLocationEvent(BaseEvent):
     zone: str = "UNKNOWN"
     confidence: float = 0.0
     time_of_arrival: float = 0.0
+    details: Dict[str, Any] = field(default_factory=dict)
 
 
 # ==============================================================================

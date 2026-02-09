@@ -141,6 +141,14 @@ class GridTopology:
             "connections": {k: v.to_dict() for k, v in self.connections.items()}
         }
 
+    @staticmethod
+    def from_circuit_model(circuit: 'CircuitModel') -> 'GridTopology':
+        """Create a GridTopology from a CircuitModel."""
+        topology = GridTopology()
+        # This implementation is a placeholder for domain integration.
+        # The active conversion happens in GridEmulator.load_circuit.
+        return topology
+
 
 # ==============================================================================
 # FAULT ANALYSIS MODELS

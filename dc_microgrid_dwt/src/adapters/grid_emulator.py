@@ -18,6 +18,7 @@ from src.domain.models import (
     GridTopology, GridNode, GridConnection,
     NodeType, NodeStatus, ConnectionStatus, FaultType
 )
+from src.domain.circuit import CircuitModel, Bus, Line, Generator, Load
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,11 @@ class GridEmulator(IGridEmulator, ISensor):
         self.base_voltage = base_voltage
         self.sample_rate = sample_rate
         self.noise_level = 0.5  # Base noise sigma
+        self._running = False
+        self._thread = None
+        self._last_step_time = time.time()
         
+        # Fault state        
         # Fault state
         self.fault_config = FaultConfig()
         self.status = "NORMAL"
@@ -67,98 +72,202 @@ class GridEmulator(IGridEmulator, ISensor):
         self._sample_count = 0
         self._start_time = time.time()
         
-        # Initialize default topology
-        self.topology = GridTopology()
+        # Multi-Node History Buffers (1 second window at 20kHz)
+        self.history_size = 20000 
+        self.history: Dict[str, np.ndarray] = {} 
+        # Active node for reading (sensor location)
+        self.active_node = "1" 
+        self.history_idx = 0
+        
+        # Initialize default topology (EMPTY)
+        self.topology = None # Wait for load_circuit
         self._init_default_topology()
+
+    def load_circuit(self, circuit: CircuitModel):
+        """
+        Load a CircuitModel and update the internal GridTopology.
+        This effectively "reprograms" the emulator with the new circuit.
+        """
+        with self._lock:
+            # Clear existing topology
+            self.topology = GridTopology()
+            
+            # Map Buses -> GridNodes
+            for bus in circuit.buses:
+                node_id = str(bus.id)
+                node = GridNode(
+                    node_id=node_id,
+                    node_type=NodeType.BUS,
+                    name=bus.name,
+                    voltage=float(bus.voltage_kv * 1000.0), # kV -> V
+                    current=0.0,
+                    power=0.0,
+                    position=(bus.x, bus.y)
+                )
+                self.topology.add_node(node)
+                
+                # Initialize history buffer for this node
+                self.history[node_id] = np.full(self.history_size, 400.0) # Init with 400V
+                
+            # Map Generators -> Update Nodes properties
+            for gen in circuit.generators:
+                node_id = str(gen.bus_id)
+                if node_id in self.topology.nodes:
+                    node = self.topology.nodes[node_id]
+                    node.node_type = NodeType.SOURCE
+                    node.power = float(gen.p_mw * 1e6) # MW -> W
+
+            # Map Loads -> Update Nodes properties
+            for load in circuit.loads:
+                node_id = str(load.bus_id)
+                if node_id in self.topology.nodes:
+                    node = self.topology.nodes[node_id]
+                    node.node_type = NodeType.LOAD
+                    node.power = float(load.p_mw * 1e6) # MW -> W
+            
+            # Map Lines -> GridConnections
+            for line in circuit.lines:
+                conn = GridConnection(
+                    connection_id=str(line.id),
+                    from_node=str(line.from_bus),
+                    to_node=str(line.to_bus),
+                    impedance=float(line.r_ohm),
+                    status=ConnectionStatus.CLOSED if line.status == 1 else ConnectionStatus.OPEN
+                )
+                self.topology.add_connection(conn)
+            
+            logger.info(f"Loaded circuit '{circuit.name}' with {len(circuit.buses)} buses into Emulator.")
         
         # Active node for voltage reading
         self.active_node = "BUS_DC"
         
     def _init_default_topology(self):
         """Initialize default grid topology for Digital Twin."""
-        # Create nodes
-        nodes = [
-            GridNode(
-                node_id="SOURCE_A",
-                node_type=NodeType.SOURCE,
-                name="Solar Array A",
-                voltage=400.0,
-                current=10.0,
-                power=4000.0,
-                position=(0.0, 0.5)
-            ),
-            GridNode(
-                node_id="BUS_DC",
-                node_type=NodeType.BUS,
-                name="Main DC Bus",
-                voltage=400.0,
-                current=25.0,
-                power=10000.0,
-                position=(0.5, 0.5)
-            ),
-            GridNode(
-                node_id="LOAD_CRITICAL",
-                node_type=NodeType.LOAD,
-                name="Critical Load",
-                voltage=400.0,
-                current=8.0,
-                power=3200.0,
-                position=(1.0, 0.3)
-            ),
-            GridNode(
-                node_id="BATTERY",
-                node_type=NodeType.STORAGE,
-                name="Battery Storage",
-                voltage=400.0,
-                current=-3.0,  # Charging
-                power=-1200.0,
-                position=(1.0, 0.7),
-                properties={"soc": 75.0}
-            ),
-            GridNode(
-                node_id="CONVERTER",
-                node_type=NodeType.CONVERTER,
-                name="Zeta Converter",
-                voltage=400.0,
-                current=12.0,
-                power=4800.0,
-                position=(0.5, 0.2)
-            )
-        ]
+        # Intentionally empty - enforced Model-Driven approach
+        pass
+
+    def start(self):
+        """Start the background simulation thread."""
+        if self.topology is None:
+            logger.warning("Starting emulator without a loaded circuit model. Waiting for load_circuit().")
+            
+        if not self._running:
+            self._running = True
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+            logger.info("Grid Emulator started")
+
+    def stop(self):
+        """Stop the background simulation thread."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        logger.info("Grid Emulator stopped")
+
+    def _run_loop(self):
+        """Main simulation loop running in background thread."""
+        while self._running:
+            try:
+                self._run_simulation_step()
+                time.sleep(1.0 / self.sample_rate)
+            except Exception as e:
+                logger.error(f"Error in simulation loop: {e}")
+                time.sleep(0.1)
+
+    def _run_simulation_step(self):
+        """Execute one step of the physical simulation."""
+        with self._lock:
+            # Enforced Model-Driven: Do nothing if no circuit loaded
+            if not self.topology or not self.topology.nodes:
+                return
+
+            t = self._sample_count / self.sample_rate
+            self._sample_count += 1
+            
+            # --- UNIFIED MULTI-NODE SIMULATION ---
+            # Instead of just reading one node, we simulate the physics for ALL nodes
+            # based on the fault condition.
+            
+            for node_id, node in self.topology.nodes.items():
+                # Base voltage (ideal)
+                v = 400.0 # Simplify: All nodes start at nominal
+                
+                # Add noise
+                v += np.random.normal(0, self.noise_level)
+                
+                # Apply Fault Logic if active
+                if self.fault_config.active:
+                    # Calculate distance from fault to this node
+                    # (Simplified: Manhattan distance from 'location' to 'node_id')
+                    # Ideally use graph traversal, but for now we rely on the topology logic
+                    
+                    dist_to_fault = 0.0
+                    if self.fault_config.location == node_id:
+                        dist_to_fault = 0.0
+                    else:
+                        # Heuristic: If we have a 'distance' property on connections, use it.
+                        # For now, assume a generic distance based on "how far" it is in the list
+                        # This is a PLACEHOLDER for full power flow
+                        dist_to_fault = 100.0 # Default "far"
+                        
+                        # Hack for Reference Grid:
+                        # Solar(2)-PCC(1)-Battery(3)-LoadA(4)-LoadB(5)
+                        # We can implement a tiny lookup for the reference grid for realism
+                        if self.fault_config.location == "1": # PCC
+                            if node_id in ["2", "3"]: dist_to_fault = 100
+                            elif node_id in ["4", "5"]: dist_to_fault = 300
+                            elif node_id == "6": dist_to_fault = 400
+                            
+                    # Apply fault effect with specific distance
+                    v = self._apply_fault_to_voltage(v, t, dist_to_fault)
+                
+                # Update Node State
+                node.voltage = v
+                
+                # Update Buffer using ring buffer logic
+                # We use a global index for efficiency
+                idx = self._sample_count % self.history_size
+                self.history[node_id][idx] = v
+                self.history_idx = idx
+
+    def _apply_fault_to_voltage(self, voltage: float, t: float, distance_m: float) -> float:
+        """Apply fault physics to a voltage signal based on distance."""
+        elapsed = time.time() - self.fault_config.start_time
+        sev = self.fault_config.severity
+        ft = self.fault_config.fault_type
         
-        for node in nodes:
-            self.topology.add_node(node)
+        # Attenuation based on distance
+        attenuation = 1.0 / (1.0 + (distance_m / 100.0))
         
-        # Create connections
-        connections = [
-            GridConnection(
-                connection_id="LINE_1",
-                from_node="SOURCE_A",
-                to_node="BUS_DC",
-                current_flow=10.0
-            ),
-            GridConnection(
-                connection_id="LINE_2",
-                from_node="BUS_DC",
-                to_node="LOAD_CRITICAL",
-                current_flow=8.0
-            ),
-            GridConnection(
-                connection_id="LINE_3",
-                from_node="BUS_DC",
-                to_node="BATTERY",
-                current_flow=-3.0
-            ),
-            GridConnection(
-                connection_id="LINE_4",
-                from_node="BUS_DC",
-                to_node="CONVERTER",
-                current_flow=12.0
-            )
-        ]
+        if ft == FaultType.LINE_TO_LINE:
+            # 60% dip at source, damped oscillation
+            dip = 0.6 * sev * attenuation
+            voltage *= (1.0 - dip)
+            
+            freq = 5000 
+            damping = np.exp(-elapsed * 50)
+            transient = sev * 100 * np.sin(2 * np.pi * freq * t) * damping * attenuation
+            voltage += transient
+            
+        elif ft == FaultType.LINE_TO_GROUND:
+             # 40% dip
+            dip = 0.4 * sev * attenuation
+            voltage *= (1.0 - dip)
+            
+            freq = 1000
+            damping = np.exp(-elapsed * 20)
+            transient = sev * 80 * np.sin(2 * np.pi * freq * t) * damping * attenuation
+            voltage += transient
+            
+        return voltage
         
-        for conn in connections:
-            self.topology.add_connection(conn)
+    def get_history(self, node_id: str) -> np.ndarray:
+        """Get ordered history buffer for a node."""
+        if node_id not in self.history:
+            return np.array([])
+        
+        # Roll buffer so newest is last
+        return np.roll(self.history[node_id], -self.history_idx - 1)
 
     def inject_fault(self, fault_type: str, severity: float, location: str = "BUS_DC", properties: Dict[str, Any] = None):
         """
@@ -207,28 +316,35 @@ class GridEmulator(IGridEmulator, ISensor):
 
     def read(self) -> float:
         """
-        Generate a single voltage sample with fault effects.
+        Return the current voltage of the active node (simulated ADC).
         Implements ISensor interface.
         """
         with self._lock:
-            self._sample_count += 1
-            t = self._sample_count / self.sample_rate
+            # Enforced Model-Driven: Return 0.0 if no circuit loaded
+            if not self.topology or not self.topology.nodes:
+                return 0.0
+
+            # Determine active node (default to first bus or specific ID)
+            # For now, let's assume we read from "Main_PCC_Bus" or similar
+            # In a real system, we'd have multiple sensors.
+            # We can use a configured 'sensor_node_id' 
+            # Determine active node (default to first bus or specific ID)
+            target_node = "1" 
             
-            # Base signal
-            voltage = self.base_voltage
-            
-            # Add base noise
-            voltage += np.random.normal(0, self.noise_level)
-            
-            # Apply fault effects
-            if self.fault_config.active:
-                voltage = self._apply_fault_effect(voltage, t)
+            if hasattr(self, 'active_node') and self.active_node in self.topology.nodes:
+                target_node = self.active_node
+            elif "1" not in self.history:
+                # Fallback to any node if available
+                if not self.history:
+                    return 0.0
+                target_node = next(iter(self.history.keys()))
                 
-            # Update topology node voltage
-            if self.active_node in self.topology.nodes:
-                self.topology.nodes[self.active_node].voltage = voltage
+            if target_node in self.topology.nodes:
+                node = self.topology.nodes[target_node]
+                val = node.voltage
+                return float(val)
                 
-            return float(voltage)
+            return 0.0
 
     def read_batch(self, count: int) -> List[float]:
         """Read voltage samples."""

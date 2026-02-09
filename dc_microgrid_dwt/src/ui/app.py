@@ -46,6 +46,8 @@ from src.agents.supervision.health_monitor import HealthMonitorAgent
 from src.agents.supervision.ai_classifier import AIClassifierAgent
 from src.agents.supervision.replay_recorder import ReplayRecorderAgent
 from src.agents.supervision.report_generator import ReportGeneratorAgent
+from src.domain.circuit import CircuitModel
+from src.adapters.matlab_bridge import MatlabBridge
 
 # ==============================================================================
 # PAGE CONFIGURATION
@@ -214,6 +216,7 @@ def init_session_state():
         'report_generator': None,
         'selected_node': None,
         'fault_location': None,
+        'circuit_model': CircuitModel(), # Default empty model
     }
     
     for key, value in defaults.items():
@@ -259,7 +262,7 @@ def start_system():
         DWTEngineAgent("DWTEngine", bus),
         DetailAnalyzerAgent("DetailAnalyzer", bus),
         ThresholdGuardAgent("ThresholdGuard", bus, {"d1_peak_max": 100.0}),
-        PreciseFaultLocatorAgent("FaultLocator", bus),
+        PreciseFaultLocatorAgent("FaultLocator", bus, {"emulator": emulator}),
         FaultVoterAgent("FaultVoter", bus),
         TripSequencerAgent("TripSequencer", bus),
         HealthMonitorAgent("HealthMonitor", bus),
@@ -267,6 +270,11 @@ def start_system():
         ReplayRecorderAgent("ReplayRecorder", bus),
         ReportGeneratorAgent("ReportGenerator", bus),
     ]
+    
+    # 7a. Create and Configure Sampler (The "ADC")
+    sampler = SamplerAgent("Sampler", bus)
+    sampler.set_sensor(emulator)
+    agents.append(sampler)
     
     for agent in agents:
         registry.register(agent)
@@ -386,8 +394,16 @@ def process_events():
                 st.session_state.fault_location = {
                     'distance': event.distance_m,
                     'zone': event.zone,
-                    'confidence': event.confidence
+                    'confidence': event.confidence,
+                    'details': getattr(event, 'details', {})
                 }
+                # Add to timeline
+                st.session_state.timeline_data.append({
+                    'time': event.timestamp,
+                    'source': 'FaultLocator',
+                    'message': f"Fault Located at {event.distance_m:.2f}m ({event.zone})",
+                    'details': getattr(event, 'details', {})
+                })
                 
             elif isinstance(event, SystemTripEvent):
                 st.session_state.system_status = 'TRIPPED'
@@ -450,12 +466,21 @@ def render_sidebar():
         
         # Navigation
         st.markdown("### 📍 Navigation")
-        page = st.radio(
-            "Select View",
-            ["Dashboard", "Digital Twin", "Wavelet Inspector", 
-             "Fault Timeline", "AI Diagnosis", "Reports", "System Health"],
-            label_visibility="collapsed"
-        )
+        
+        # Enforce Model-Driven Workflow
+        model_loaded = st.session_state.circuit_model is not None and len(st.session_state.circuit_model.buses) > 0
+        
+        if not model_loaded:
+            st.warning("⚠️ No Microgrid Model Loaded")
+            st.info("Please load a model in the Circuit Designer to proceed.")
+            page = "Circuit Designer"
+        else:
+            page = st.radio(
+                "Select View",
+                ["Dashboard", "Digital Twin", "Circuit Designer", "Wavelet Inspector", 
+                 "Fault Timeline", "AI Diagnosis", "Reports", "System Health"],
+                label_visibility="collapsed"
+            )
         
         st.markdown("---")
         
@@ -516,10 +541,6 @@ def render_dashboard():
     # Process latest events
     process_events()
     
-    # Generate samples if running
-    if st.session_state.system_running:
-        for _ in range(50):  # Generate batch
-            generate_sample()
     
     # KPI Metrics Row
     col1, col2, col3, col4 = st.columns(4)
@@ -738,6 +759,134 @@ def render_digital_twin():
                     new_status = "INACTIVE" if node['status'] == "ACTIVE" else "ACTIVE"
                     st.session_state.emulator.set_node_status(selected, new_status)
 
+def render_circuit_designer():
+    """Render the Circuit Designer / Editor page."""
+    st.markdown("## 🛠️ Circuit Designer (MATLAB Bridge)")
+    
+    col_tools, col_editor = st.columns([1, 1])
+    
+    with col_tools:
+        st.markdown("### File Operations")
+        uploaded_file = st.file_uploader("Load Circuit (.mat)", type=['mat'])
+        
+        if uploaded_file is not None:
+            # Save to temp file to read with bridge
+            with open("temp_upload.mat", "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            try:
+                model = MatlabBridge.load_model("temp_upload.mat")
+                if model:
+                    st.session_state.circuit_model = model
+                    st.success(f"Loaded {model.name} with {len(model.buses)} buses")
+                    
+                    # Update Emulator if running
+                    if st.session_state.emulator:
+                        st.session_state.emulator.load_circuit(model)
+                        st.info("Emulator updated with new circuit")
+            except Exception as e:
+                st.error(f"Failed to load: {e}")
+                
+        if st.button("💾 Save as Default (grid.mat)"):
+            MatlabBridge.save_model(st.session_state.circuit_model, "grid.mat")
+            st.success("Saved to grid.mat")
+            
+        if st.button("🔄 Reload from Default"):
+            model = MatlabBridge.load_model("grid.mat")
+            if model:
+                st.session_state.circuit_model = model
+                if st.session_state.emulator:
+                    st.session_state.emulator.load_circuit(model)
+                st.success("Reloaded default grid")
+                
+        # Offer Reference Model
+        if st.button("🏗️ Load Reference Microgrid (6-Bus)", type="primary"):
+            try:
+                # Path to reference model generated by script
+                ref_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../reference_microgrid.mat'))
+                model = MatlabBridge.load_model(ref_path)
+                if model:
+                    st.session_state.circuit_model = model
+                    if st.session_state.emulator:
+                        st.session_state.emulator.load_circuit(model)
+                    st.success("Loaded Reference Microgrid")
+            except Exception as e:
+                st.error(f"Failed to load reference: {e}")
+    
+    with col_editor:
+        st.markdown("### Component Editor")
+        model = st.session_state.circuit_model
+        
+        comp_type = st.selectbox("Component Type", ["Bus", "Line", "Generator", "Load"])
+        
+        if comp_type == "Bus":
+            buses = {f"{b.id}: {b.name}": b for b in model.buses}
+            selected_name = st.selectbox("Select Bus", list(buses.keys()))
+            if selected_name:
+                bus = buses[selected_name]
+                new_v = st.number_input("Voltage (kV)", 0.0, 1000.0, bus.voltage_kv)
+                new_name = st.text_input("Name", bus.name)
+                if st.button("Update Bus"):
+                    bus.voltage_kv = new_v
+                    bus.name = new_name
+                    st.success("Updated")
+                    
+        elif comp_type == "Line":
+            lines = {f"Line {l.id} ({l.from_bus}->{l.to_bus})": l for l in model.lines}
+            selected_name = st.selectbox("Select Line", list(lines.keys()))
+            if selected_name:
+                line = lines[selected_name]
+                new_r = st.number_input("Resistance (Ohm)", 0.0, 100.0, line.r_ohm, format="%.4f")
+                new_x = st.number_input("Reactance (Ohm)", 0.0, 100.0, line.x_ohm, format="%.4f")
+                if st.button("Update Line"):
+                    line.r_ohm = new_r
+                    line.x_ohm = new_x
+                    st.success("Updated")
+
+    # Visualization
+    st.markdown("### Circuit Diagram")
+    model = st.session_state.circuit_model
+    if model.buses:
+        fig = go.Figure()
+        
+        # Draw Lines
+        for line in model.lines:
+            # Find coordinates
+            b1 = next((b for b in model.buses if b.id == line.from_bus), None)
+            b2 = next((b for b in model.buses if b.id == line.to_bus), None)
+            
+            if b1 and b2:
+                fig.add_trace(go.Scatter(
+                    x=[b1.x, b2.x], y=[b1.y, b2.y],
+                    mode='lines',
+                    line=dict(width=line.status*2 + 1, color='#888'),
+                    hoverinfo='text',
+                    text=f"Line {line.id}: R={line.r_ohm}"
+                ))
+        
+        # Draw Buses
+        for bus in model.buses:
+            color = '#4CAF50' if bus.type == 'Slack' else '#636EFA'
+            fig.add_trace(go.Scatter(
+                x=[bus.x], y=[bus.y],
+                mode='markers+text',
+                marker=dict(size=20, color=color),
+                text=bus.name,
+                textposition='bottom center',
+                name=bus.name
+            ))
+            
+        fig.update_layout(
+            showlegend=False,
+            height=500,
+            margin=dict(l=0, r=0, t=20, b=0),
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No circuit loaded. Load a file or create from scratch.")
+
 def render_wavelet_inspector():
     """Render the wavelet analysis inspector."""
     st.markdown("## 📈 Wavelet Analysis Inspector")
@@ -837,67 +986,119 @@ def render_wavelet_inspector():
             st.info("Run a simulation to see wavelet analysis")
 
 def render_fault_timeline():
-    """Render the fault timeline / black box view."""
-    st.markdown("## 📼 Fault Timeline (Black Box)")
+    """Render the fault timeline and analysis view."""
+    st.markdown("## 🕵️ Fault Investigation Timeline")
     
-    if st.session_state.trip_events:
-        # Show latest trip event
-        trip = st.session_state.trip_events[-1]
-        
-        st.markdown(f"### Trip Event at {datetime.fromtimestamp(trip['time']).strftime('%H:%M:%S.%f')[:-3]}")
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Reason", trip['reason'])
-        col2.metric("Detection Latency", f"{trip['latency_ms']:.2f} ms")
-        col3.metric("Status", "TRIPPED", delta_color="inverse")
-        
-        # Timeline visualization using Gantt-like chart
-        timeline_data = [
-            dict(Task="Fault Injection", Start=0, Finish=3, Resource="Emulator"),
-            dict(Task="Voltage Drop", Start=3, Finish=5, Resource="Sensor"),
-            dict(Task="DWT Analysis", Start=5, Finish=6, Resource="DSP"),
-            dict(Task="Threshold Check", Start=6, Finish=6.5, Resource="Guard"),
-            dict(Task="Voter Decision", Start=6.5, Finish=7, Resource="Voter"),
-            dict(Task="Trip Command", Start=7, Finish=8, Resource="Sequencer"),
-        ]
-        
-        df = pd.DataFrame(timeline_data)
-        
-        fig = px.timeline(
-            df, 
-            x_start="Start", 
-            x_end="Finish", 
-            y="Task",
-            color="Resource",
-            color_discrete_map={
-                "Emulator": "#636EFA",
-                "Sensor": "#EF553B",
-                "DSP": "#00CC96",
-                "Guard": "#AB63FA",
-                "Voter": "#FFA15A",
-                "Sequencer": "#19D3F3"
-            }
-        )
-        
-        fig.update_layout(
-            height=350,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            xaxis_title="Time (ms)"
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Replay Controls
-        st.markdown("---")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.button("⏪ Rewind")
-        col2.button("▶️ Play")
-        col3.button("⏸️ Pause")
-        col4.button("💾 Export")
-        
-    else:
-        st.info("No trip events recorded. Inject a fault to see the timeline.")
+    # Check for both trip events and fault location events
+    has_events = (len(st.session_state.trip_events) > 0) or (len(st.session_state.timeline_data) > 0)
+    
+    if not has_events:
+        st.info("No fault events detected yet. Inject a fault to see the analysis.")
+        return
+
+    # Tabs for different views
+    tab1, tab2 = st.tabs(["📝 Investigation Log", "📼 Black Box Replay"])
+    
+    with tab1:
+        if not st.session_state.timeline_data:
+             st.info("No detailed analysis data available.")
+        else:
+            # Reverse order to show newest first
+            for i, event in enumerate(reversed(st.session_state.timeline_data)):
+                time_str = datetime.fromtimestamp(event['time']).strftime('%H:%M:%S.%f')[:-3]
+                
+                with st.expander(f"⏰ {time_str} - {event['message']}", expanded=(i==0)):
+                    cols = st.columns([1, 2])
+                    
+                    with cols[0]:
+                        st.markdown("**Event Details**")
+                        st.write(f"Source: {event['source']}")
+                        
+                        details = event.get('details', {})
+                        if details:
+                            st.markdown("### 🧠 Logic Trace")
+                            if 'energy_ratio' in details:
+                                ratio = details['energy_ratio']
+                                dist = details.get('estimated_dist', 0)
+                                st.metric("Energy Ratio (D1/D2)", f"{ratio:.2f}")
+                                st.metric("Estimated Distance", f"{dist:.1f} m")
+                                st.caption("Ratio decreases as distance increases due to HF attenuation.")
+                    
+                    with cols[1]:
+                        # Waveform Visualization
+                        if 'node_waveforms' in details and details['node_waveforms']:
+                            st.markdown("### 📉 Recorded Component Signals")
+                            waveforms = details['node_waveforms']
+                            
+                            fig = go.Figure()
+                            for node_id, data in waveforms.items():
+                                # Create time axis based on 20kHz sampling (downsampled by 10)
+                                t_axis = np.linspace(0, 1.0, len(data))
+                                fig.add_trace(go.Scatter(x=t_axis, y=data, name=f"Node {node_id}"))
+                                
+                            fig.update_layout(
+                                title="Voltage Waveforms during Fault Window",
+                                xaxis_title="Time (s)",
+                                yaxis_title="Voltage (V)",
+                                height=300,
+                                margin=dict(l=0, r=0, t=30, b=0)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            if event['source'] == 'FaultLocator':
+                                st.warning("No waveform snapshot available for this event.")
+
+        # Clear Timeline Button
+        if st.button("Clear Timeline", key="clear_timeline"):
+            st.session_state.timeline_data = []
+            st.rerun()
+
+    with tab2:
+        if st.session_state.trip_events:
+            # Show latest trip event
+            trip = st.session_state.trip_events[-1]
+            
+            st.markdown(f"### Trip Event at {datetime.fromtimestamp(trip['time']).strftime('%H:%M:%S.%f')[:-3]}")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Reason", trip['reason'])
+            col2.metric("Detection Latency", f"{trip['latency_ms']:.2f} ms")
+            col3.metric("Status", "TRIPPED", delta_color="inverse")
+            
+            # Restore Timeline visualization (Gantt-like chart)
+            st.markdown("### ⏱️ Sequence of Operations")
+            timeline_data = [
+                dict(Task="Fault Injection", Start=0, Finish=2, Resource="Emulator"),
+                dict(Task="Wave propagation", Start=2, Finish=5, Resource="Line"),
+                dict(Task="DWT Detail Capture", Start=5, Finish=7, Resource="DSP"),
+                dict(Task="Threshold Violation", Start=7, Finish=8, Resource="Guard"),
+                dict(Task="Fault Voting", Start=8, Finish=9, Resource="Voter"),
+                dict(Task="Trip Execution", Start=9, Finish=10, Resource="Sequencer"),
+            ]
+            
+            df = pd.DataFrame(timeline_data)
+            fig = px.timeline(
+                df, x_start="Start", x_end="Finish", y="Task", color="Resource",
+                color_discrete_map={
+                    "Emulator": "#e94560", "Line": "#f8b500", "DSP": "#00CC96",
+                    "Guard": "#AB63FA", "Voter": "#FFA15A", "Sequencer": "#19D3F3"
+                }
+            )
+            fig.update_layout(height=300, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Replay Controls
+            st.markdown("---")
+            st.markdown("### 📼 Digital Replay Control")
+            rcol1, rcol2, rcol3, rcol4 = st.columns(4)
+            rcol1.button("⏪ Rewind", key="btn_rewind")
+            rcol2.button("▶️ Play", key="btn_play")
+            rcol3.button("⏸️ Pause", key="btn_pause")
+            rcol4.button("💾 Export Replay", key="btn_export")
+            
+            st.slider("Replay Position", 0, 100, 50, help="Drag to seek within the recording")
+        else:
+            st.info("No system trips recorded. Inject a fault to see the sequence replay.")
 
 def render_ai_diagnosis():
     """Render the AI diagnosis panel."""
@@ -944,36 +1145,41 @@ def render_ai_diagnosis():
             
             if diag['causes']:
                 causes = diag['causes'][:5]
-                cause_names = [c.get('cause', 'Unknown')[:30] for c in causes]
-                probs = [c.get('probability', 0) * 100 for c in causes]
+                # Filter out causes with no name
+                causes = [c for c in causes if c.get('cause')]
                 
-                fig = go.Figure(go.Bar(
-                    x=probs,
-                    y=cause_names,
-                    orientation='h',
-                    marker_color=['#e94560' if p > 50 else '#FFA726' if p > 20 else '#4CAF50' for p in probs]
-                ))
-                
-                fig.update_layout(
-                    height=300,
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    xaxis_title="Probability (%)"
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
+                if causes:
+                    cause_names = [c.get('cause')[:30] for c in causes]
+                    probs = [c.get('probability', 0) * 100 for c in causes]
+                    
+                    fig = go.Figure(go.Bar(
+                        x=probs,
+                        y=cause_names,
+                        orientation='h',
+                        marker_color=['#e94560' if p > 50 else '#FFA726' if p > 20 else '#4CAF50' for p in probs]
+                    ))
+                    
+                    fig.update_layout(
+                        height=300,
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        xaxis=dict(title='Probability %', range=[0, 100]),
+                        yaxis=dict(autorange="reversed")
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No probable causes identified.")
+            
+            st.markdown("### Recommendations")
+            if "High Impedance" in diag['diagnosis']:
+                st.warning("🔍 Inspect line segment 3 near Bus 4 for potential insulation degradation.")
+            elif "Line-to-Ground" in diag['diagnosis']:
+                st.error("🚨 Critical ground fault detected. Remote isolation recommended.")
             else:
-                st.info("No probable causes identified")
-                
-            st.markdown("### Recommended Actions")
-            st.markdown("""
-            1. 🔍 Inspect affected equipment
-            2. 📊 Review historical data
-            3. 🔧 Schedule maintenance if recurrent
-            4. 📝 Document incident
-            """)
+                st.info("System behavior is within normal parameters. Continue monitoring.")
     else:
-        st.info("Run a simulation with fault injection to see AI diagnosis")
+        st.info("Waiting for AI analysis results... Run a fault simulation to trigger diagnosis.")
 
 def render_reports():
     """Render the reports generation page."""
@@ -1134,6 +1340,8 @@ def main():
         render_dashboard()
     elif page == "Digital Twin":
         render_digital_twin()
+    elif page == "Circuit Designer":
+        render_circuit_designer()
     elif page == "Wavelet Inspector":
         render_wavelet_inspector()
     elif page == "Fault Timeline":

@@ -32,7 +32,13 @@ class SamplerAgent(BaseAgent):
             
             if self.sensor:
                 val = self.sensor.read()
-                event = VoltageSampleEvent(timestamp=start_time, voltage=val, sample_index=sample_index)
+                event = VoltageSampleEvent(
+                    timestamp=start_time,
+                    voltage=val,
+                    current=val / 40.0, # Simple simulated current
+                    node_id="BUS_DC",
+                    sample_index=sample_index
+                )
                 self.publish(event)
                 sample_index += 1
             
