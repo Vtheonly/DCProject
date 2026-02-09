@@ -116,6 +116,15 @@ class AIAnalysisEvent(BaseEvent):
     probable_causes: List[Dict[str, float]] = field(default_factory=list)
 
 
+@dataclass
+class FaultLocationEvent(BaseEvent):
+    """Precise fault location result event."""
+    distance_m: float = 0.0
+    zone: str = "UNKNOWN"
+    confidence: float = 0.0
+    time_of_arrival: float = 0.0
+
+
 # ==============================================================================
 # CONTROL EVENTS (Trip & Converter)
 # ==============================================================================

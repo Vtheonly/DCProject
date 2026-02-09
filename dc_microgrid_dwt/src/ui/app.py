@@ -31,7 +31,7 @@ from src.framework.registry import AgentRegistry
 from src.domain.events import (
     VoltageSampleEvent, DWTResultEvent, ProcessingResultEvent,
     SystemTripEvent, HealthStatusEvent, AIAnalysisEvent,
-    FaultInjectionEvent, ConverterStatusEvent
+    FaultInjectionEvent, ConverterStatusEvent, FaultLocationEvent
 )
 from src.adapters.grid_emulator import GridEmulator
 from src.agents.ingestion.sampler import SamplerAgent
@@ -40,6 +40,7 @@ from src.agents.processing.dwt_engine import DWTEngineAgent
 from src.agents.processing.detail_analyzer import DetailAnalyzerAgent
 from src.agents.detection.threshold_guard import ThresholdGuardAgent
 from src.agents.detection.fault_voter import FaultVoterAgent
+from src.agents.processing.fault_locator import PreciseFaultLocatorAgent
 from src.agents.control.trip_sequencer import TripSequencerAgent
 from src.agents.supervision.health_monitor import HealthMonitorAgent
 from src.agents.supervision.ai_classifier import AIClassifierAgent
@@ -212,6 +213,7 @@ def init_session_state():
         'wavelet_settings': {'family': 'db4', 'level': 4},
         'report_generator': None,
         'selected_node': None,
+        'fault_location': None,
     }
     
     for key, value in defaults.items():
@@ -247,7 +249,9 @@ def start_system():
     bus.subscribe(ProcessingResultEvent, bridge_to_ui)
     bus.subscribe(SystemTripEvent, bridge_to_ui)
     bus.subscribe(HealthStatusEvent, bridge_to_ui)
+    bus.subscribe(HealthStatusEvent, bridge_to_ui)
     bus.subscribe(AIAnalysisEvent, bridge_to_ui)
+    bus.subscribe(FaultLocationEvent, bridge_to_ui)
     
     # Create agents
     agents = [
@@ -255,6 +259,7 @@ def start_system():
         DWTEngineAgent("DWTEngine", bus),
         DetailAnalyzerAgent("DetailAnalyzer", bus),
         ThresholdGuardAgent("ThresholdGuard", bus, {"d1_peak_max": 100.0}),
+        PreciseFaultLocatorAgent("FaultLocator", bus),
         FaultVoterAgent("FaultVoter", bus),
         TripSequencerAgent("TripSequencer", bus),
         HealthMonitorAgent("HealthMonitor", bus),
@@ -291,17 +296,19 @@ def stop_system():
     st.session_state.system_status = 'STOPPED'
     add_log("INFO", "System stopped")
 
-def inject_fault(fault_type: str, severity: float, location: str = "BUS_DC"):
+def inject_fault(fault_type: str, severity: float, location: str = "BUS_DC", properties: Dict[str, Any] = None):
     """Inject a fault into the emulator."""
     if st.session_state.emulator:
-        st.session_state.emulator.inject_fault(fault_type, severity, location)
+        st.session_state.emulator.inject_fault(fault_type, severity, location, properties)
         st.session_state.last_fault_config = {
             'type': fault_type,
             'severity': severity,
             'location': location,
-            'time': time.time()
+            'location': location,
+            'time': time.time(),
+            'properties': st.session_state.get('fault_properties', {})
         }
-        add_log("WARNING", f"Fault injected: {fault_type} at {location} (severity: {severity:.1%})")
+        add_log("WARNING", f"Fault injected: {fault_type} at {location} (severity: {severity:.1%}) properties={st.session_state.get('fault_properties')}")
 
 def clear_fault():
     """Clear active fault."""
@@ -373,6 +380,13 @@ def process_events():
                     'diagnosis': event.diagnosis,
                     'confidence': event.confidence,
                     'causes': event.probable_causes
+                }
+
+            elif isinstance(event, FaultLocationEvent):
+                st.session_state.fault_location = {
+                    'distance': event.distance_m,
+                    'zone': event.zone,
+                    'confidence': event.confidence
                 }
                 
             elif isinstance(event, SystemTripEvent):
@@ -467,11 +481,14 @@ def render_sidebar():
             "Location",
             ["BUS_DC", "SOURCE_A", "LOAD_CRITICAL", "BATTERY"]
         )
+
+        distance = st.slider("Fault Distance (m)", 0, 1000, 50, 10)
+        st.session_state.fault_properties = {"distance": distance}
         
         col1, col2 = st.columns(2)
         with col1:
             if st.button("⚡ INJECT", width='stretch', type="primary"):
-                inject_fault(fault_type, severity, location)
+                inject_fault(fault_type, severity, location, {"distance": distance})
         with col2:
             if st.button("🔄 CLEAR", width='stretch'):
                 clear_fault()
@@ -524,6 +541,24 @@ def render_dashboard():
         prob = st.session_state.ai_diagnosis['probability'] * 100 if st.session_state.ai_diagnosis else 0
         st.metric("Fault Probability", f"{prob:.1f}%")
     
+    # Charts
+    if st.session_state.fault_location:
+            loc = st.session_state.fault_location
+            
+            # Fault Location Result Bar
+            st.markdown(f"""
+            <div style="background: rgba(233, 69, 96, 0.1); border: 1px solid #e94560; border-radius: 8px; padding: 10px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
+                <div>
+                    <h3 style="margin: 0; color: #e94560;">📍 Fault Located</h3>
+                    <div style="font-size: 14px; color: #ccc;">Zone: <strong>{loc['zone']}</strong> | Confidence: <strong>{loc['confidence']*100:.0f}%</strong></div>
+                </div>
+                <div style="text-align: right;">
+                    <div style="font-size: 24px; font-weight: bold; color: #fff;">{loc['distance']:.1f} m</div>
+                    <div style="font-size: 12px; color: #888;">from sensor</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
     # Charts
     col_main, col_side = st.columns([2, 1])
     

@@ -157,6 +157,26 @@ class FaultDiagnosis:
 
 
 @dataclass
+class FaultLocationResult:
+    """Result of precise fault location analysis."""
+    estimated_distance_m: float
+    confidence_score: float
+    detected_zone: str
+    arrival_timestamp: float
+    propagation_velocity_mps: float = 2.0e8  # ~2/3 speed of light in copper
+
+
+@dataclass
+class FaultLocationResult:
+    """Result of precise fault location analysis."""
+    estimated_distance_m: float
+    confidence_score: float
+    detected_zone: str
+    arrival_timestamp: float
+    propagation_velocity_mps: float = 2.0e8  # ~2/3 speed of light in copper
+
+
+@dataclass
 class TimelineStep:
     """A single step in the fault timeline."""
     step_id: str = field(default_factory=lambda: str(uuid.uuid4()))

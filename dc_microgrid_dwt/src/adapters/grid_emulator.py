@@ -31,6 +31,7 @@ class FaultConfig:
     location: str = ""
     start_time: float = 0.0
     duration: float = float('inf')
+    properties: Dict[str, Any] = None  # New field for extra params like distance
 
 
 class GridEmulator(IGridEmulator, ISensor):
@@ -159,7 +160,7 @@ class GridEmulator(IGridEmulator, ISensor):
         for conn in connections:
             self.topology.add_connection(conn)
 
-    def inject_fault(self, fault_type: str, severity: float, location: str = "BUS_DC"):
+    def inject_fault(self, fault_type: str, severity: float, location: str = "BUS_DC", properties: Dict[str, Any] = None):
         """
         Inject a fault into the grid simulation.
         
@@ -167,6 +168,7 @@ class GridEmulator(IGridEmulator, ISensor):
             fault_type: Type of fault (L2L, L2G, ARC, NOISE, DRIFT, SENSOR_FAIL)
             severity: Severity level 0.0 - 1.0
             location: Node ID where fault occurs
+            properties: Additional properties like 'distance'
         """
         with self._lock:
             try:
@@ -180,7 +182,8 @@ class GridEmulator(IGridEmulator, ISensor):
                 fault_type=ft,
                 severity=min(1.0, max(0.0, severity)),
                 location=location,
-                start_time=time.time()
+                start_time=time.time(),
+                properties=properties or {}
             )
             
             # Update node status
@@ -188,7 +191,7 @@ class GridEmulator(IGridEmulator, ISensor):
                 self.topology.set_node_status(location, NodeStatus.FAULT)
             
             self.status = f"FAULT_{ft.value}"
-            logger.warning(f"Fault injected: {ft.value} at {location} (severity: {severity})")
+            logger.warning(f"Fault injected: {ft.value} at {location} (severity: {severity}) props={properties}")
 
     def clear_fault(self):
         """Clear any active faults and restore normal operation."""
@@ -228,7 +231,7 @@ class GridEmulator(IGridEmulator, ISensor):
             return float(voltage)
 
     def read_batch(self, count: int) -> List[float]:
-        """Read multiple voltage samples."""
+        """Read voltage samples."""
         return [self.read() for _ in range(count)]
 
     def _apply_fault_effect(self, voltage: float, t: float) -> float:
@@ -237,27 +240,44 @@ class GridEmulator(IGridEmulator, ISensor):
         sev = self.fault_config.severity
         ft = self.fault_config.fault_type
         
+        # Get distance factor (default 10m if not specified)
+        props = self.fault_config.properties or {}
+        distance_m = props.get("distance", 10.0)
+        
+        # Physics: High frequencies attenuate over distance
+        # Simple simulation: Reduce transient amplitude based on distance
+        # normalized to some reference (e.g., 100m)
+        attenuation = 1.0 / (1.0 + (distance_m / 100.0))
+        
         if ft == FaultType.LINE_TO_LINE:
             # Sudden voltage drop with high-frequency transient
             voltage *= (1.0 - sev * 0.6)  # Up to 60% drop
+            
             # Add damped oscillation (ringing)
+            # Distance affects amplitude of the high-freq ringing
             freq = 5000 + np.random.uniform(-500, 500)
             damping = np.exp(-elapsed * 50)
-            voltage += sev * 100 * np.sin(2 * np.pi * freq * t) * damping
+            
+            transient = sev * 100 * np.sin(2 * np.pi * freq * t) * damping
+            voltage += transient * attenuation
             
         elif ft == FaultType.LINE_TO_GROUND:
             # Voltage drop with lower frequency oscillation
             voltage *= (1.0 - sev * 0.4)
             freq = 1000
             damping = np.exp(-elapsed * 20)
-            voltage += sev * 80 * np.sin(2 * np.pi * freq * t) * damping
+            
+            transient = sev * 80 * np.sin(2 * np.pi * freq * t) * damping
+            voltage += transient * attenuation
             
         elif ft == FaultType.ARC_FAULT:
             # Intermittent high-frequency bursts
             if np.random.random() < 0.3:  # 30% chance of arc
                 arc_noise = np.random.normal(0, 50 * sev)
                 high_freq = sev * 30 * np.sin(2 * np.pi * 8000 * t)
-                voltage += arc_noise + high_freq
+                
+                # Arcs are local, but measurement is distant
+                voltage += (arc_noise + high_freq) * attenuation
                 
         elif ft == FaultType.NOISE:
             # High-amplitude noise injection
