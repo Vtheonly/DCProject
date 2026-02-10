@@ -217,6 +217,13 @@ def init_session_state():
         'selected_node': None,
         'fault_location': None,
         'circuit_model': CircuitModel(), # Default empty model
+        'component_history': {},
+        'recording_enabled': False,
+        'recording_data': {},
+        'recordings': [],
+        'replay_mode': False,
+        'selected_recording': None,
+        'last_telemetry_update': 0.0,
     }
     
     for key, value in defaults.items():
@@ -417,14 +424,141 @@ def process_events():
         except queue.Empty:
             break
 
+def compute_node_positions(topology: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute node positions from topology or fallback layout."""
+    nodes = topology.get('nodes', {}) if topology else {}
+    positions = {}
+    missing = []
+
+    for node_id, node in nodes.items():
+        position = node.get("position")
+        if position and len(position) == 2:
+            positions[node_id] = (position[0], position[1])
+        else:
+            missing.append(node_id)
+
+    if missing:
+        count = len(missing)
+        radius = 1.0
+        for idx, node_id in enumerate(missing):
+            angle = 2 * np.pi * idx / max(count, 1)
+            positions[node_id] = (radius * np.cos(angle), radius * np.sin(angle))
+
+    return positions
+
+def estimate_node_current(node: Dict[str, Any]) -> float:
+    """Estimate current from node power and voltage."""
+    voltage = node.get("voltage", 0.0) or 0.0
+    power = node.get("power", 0.0) or 0.0
+    if voltage == 0:
+        return 0.0
+    return power / voltage
+
+def detect_transient(previous: Optional[Dict[str, Any]], current: Dict[str, Any]) -> bool:
+    """Detect transient events based on sudden deltas."""
+    if not previous:
+        return False
+    delta_v = abs(current["voltage"] - previous["voltage"])
+    delta_i = abs(current["current"] - previous["current"])
+    return delta_v > 20.0 or delta_i > 5.0
+
+def update_component_history():
+    """Record latest per-component telemetry for visualization and replay."""
+    if not st.session_state.emulator:
+        return
+
+    now = time.time()
+    if now - st.session_state.last_telemetry_update < 0.2:
+        return
+    st.session_state.last_telemetry_update = now
+
+    topology = st.session_state.emulator.get_topology()
+    nodes = topology.get("nodes", {})
+    timestamp = now
+
+    history = st.session_state.component_history
+    for node_id, node in nodes.items():
+        current = estimate_node_current(node)
+        entry = {
+            "time": timestamp,
+            "voltage": float(node.get("voltage", 0.0)),
+            "current": float(current),
+            "power": float(node.get("power", 0.0)),
+            "status": node.get("status", ""),
+        }
+        previous = history.get(node_id, [])[-1] if history.get(node_id) else None
+        entry["transient"] = detect_transient(previous, entry)
+        history.setdefault(node_id, []).append(entry)
+
+        if len(history[node_id]) > 500:
+            history[node_id] = history[node_id][-500:]
+
+        if st.session_state.recording_enabled:
+            st.session_state.recording_data.setdefault(node_id, []).append(entry.copy())
+
+    st.session_state.component_history = history
+
+def format_fault_trace(model: CircuitModel, fault_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a fault trace mapping from estimated distance to circuit elements."""
+    trace = {
+        "distance_m": fault_info.get("distance"),
+        "zone": fault_info.get("zone"),
+        "confidence": fault_info.get("confidence"),
+        "line": None,
+        "explanation": None,
+    }
+
+    if not model or not model.lines or not model.buses:
+        trace["explanation"] = "Circuit model missing line/bus data for fault trace."
+        return trace
+
+    bus_positions = {bus.id: (bus.x, bus.y) for bus in model.buses}
+    line_lengths = []
+    for line in sorted(model.lines, key=lambda l: l.id):
+        from_pos = bus_positions.get(line.from_bus, (0.0, 0.0))
+        to_pos = bus_positions.get(line.to_bus, (0.0, 0.0))
+        length = float(np.hypot(to_pos[0] - from_pos[0], to_pos[1] - from_pos[1]))
+        line_lengths.append((line, length))
+
+    total_dist = 0.0
+    target = fault_info.get("distance", 0.0) or 0.0
+    target_line = None
+    for line, length in line_lengths:
+        if total_dist + length >= target:
+            target_line = (line, total_dist, length)
+            break
+        total_dist += length
+
+    if not target_line and line_lengths:
+        target_line = (line_lengths[-1][0], total_dist, line_lengths[-1][1])
+
+    if target_line:
+        line, start_dist, length = target_line
+        trace["line"] = {
+            "id": line.id,
+            "from_bus": line.from_bus,
+            "to_bus": line.to_bus,
+            "length": length,
+            "offset_m": max(0.0, target - start_dist),
+        }
+        trace["explanation"] = (
+            f"Estimated fault distance {target:.1f}m maps to Line {line.id} "
+            f"between Bus {line.from_bus} and Bus {line.to_bus} at ~{max(0.0, target - start_dist):.1f}m."
+        )
+    else:
+        trace["explanation"] = "Unable to map fault distance to a specific line."
+
+    return trace
+
 def generate_sample():
     """Generate and publish a voltage sample from emulator."""
     if st.session_state.emulator and st.session_state.bus:
         voltage = st.session_state.emulator.read()
+        node_id = getattr(st.session_state.emulator, "active_node", "BUS_DC")
         event = VoltageSampleEvent(
             voltage=voltage,
             current=voltage / 40,  # Simulated current
-            node_id="BUS_DC"
+            node_id=node_id
         )
         st.session_state.bus.publish(event)
 
@@ -472,12 +606,12 @@ def render_sidebar():
         
         if not model_loaded:
             st.warning("⚠️ No Microgrid Model Loaded")
-            st.info("Please load a model in the Circuit Designer to proceed.")
-            page = "Circuit Designer"
+            st.info("Please load a model in the Unified Grid view to proceed.")
+            page = "Unified Grid"
         else:
             page = st.radio(
                 "Select View",
-                ["Dashboard", "Digital Twin", "Circuit Designer", "Wavelet Inspector", 
+                ["Dashboard", "Unified Grid", "Wavelet Inspector",
                  "Fault Timeline", "AI Diagnosis", "Reports", "System Health"],
                 label_visibility="collapsed"
             )
@@ -502,10 +636,15 @@ def render_sidebar():
         
         severity = st.slider("Severity", 0.1, 1.0, 0.5, 0.1)
         
-        location = st.selectbox(
-            "Location",
-            ["BUS_DC", "SOURCE_A", "LOAD_CRITICAL", "BATTERY"]
-        )
+        location_options = []
+        if st.session_state.emulator and st.session_state.emulator.get_topology():
+            location_options = list(st.session_state.emulator.get_topology().get("nodes", {}).keys())
+        elif st.session_state.circuit_model and st.session_state.circuit_model.buses:
+            location_options = [str(bus.id) for bus in st.session_state.circuit_model.buses]
+        if not location_options:
+            location_options = ["BUS_DC"]
+
+        location = st.selectbox("Location", location_options)
 
         distance = st.slider("Fault Distance (m)", 0, 1000, 50, 10)
         st.session_state.fault_properties = {"distance": distance}
@@ -668,7 +807,7 @@ def render_dashboard():
 
 def render_digital_twin():
     """Render the digital twin visualization."""
-    st.markdown("## 🌐 Grid Digital Twin")
+    st.markdown("### 🌐 Grid Digital Twin")
     
     col1, col2 = st.columns([2, 1])
     
@@ -680,15 +819,7 @@ def render_digital_twin():
             
             # Create network graph using plotly
             fig = go.Figure()
-            
-            # Node positions (manual layout)
-            positions = {
-                'SOURCE_A': (0, 0.5),
-                'BUS_DC': (0.5, 0.5),
-                'LOAD_CRITICAL': (1, 0.3),
-                'BATTERY': (1, 0.7),
-                'CONVERTER': (0.5, 0.1)
-            }
+            positions = compute_node_positions(topology)
             
             # Draw connections
             for conn_id, conn in connections.items():
@@ -725,8 +856,8 @@ def render_digital_twin():
             fig.update_layout(
                 height=500,
                 showlegend=False,
-                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-0.2, 1.2]),
-                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-0.1, 1.0]),
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 paper_bgcolor='rgba(0,0,0,0)',
                 plot_bgcolor='rgba(0,0,0,0)'
             )
@@ -761,7 +892,7 @@ def render_digital_twin():
 
 def render_circuit_designer():
     """Render the Circuit Designer / Editor page."""
-    st.markdown("## 🛠️ Circuit Designer (MATLAB Bridge)")
+    st.markdown("### 🛠️ Circuit Designer (MATLAB Bridge)")
     
     col_tools, col_editor = st.columns([1, 1])
     
@@ -820,28 +951,62 @@ def render_circuit_designer():
         comp_type = st.selectbox("Component Type", ["Bus", "Line", "Generator", "Load"])
         
         if comp_type == "Bus":
-            buses = {f"{b.id}: {b.name}": b for b in model.buses}
-            selected_name = st.selectbox("Select Bus", list(buses.keys()))
-            if selected_name:
-                bus = buses[selected_name]
-                new_v = st.number_input("Voltage (kV)", 0.0, 1000.0, bus.voltage_kv)
-                new_name = st.text_input("Name", bus.name)
-                if st.button("Update Bus"):
-                    bus.voltage_kv = new_v
-                    bus.name = new_name
-                    st.success("Updated")
+            if not model.buses:
+                st.info("No buses available yet. Load or create a circuit to edit buses.")
+            else:
+                buses = {f"{b.id}: {b.name}": b for b in model.buses}
+                selected_name = st.selectbox("Select Bus", list(buses.keys()))
+                if selected_name:
+                    bus = buses[selected_name]
+                    new_v = st.number_input("Voltage (kV)", 0.0, 1000.0, bus.voltage_kv)
+                    new_name = st.text_input("Name", bus.name)
+                    if st.button("Update Bus"):
+                        bus.voltage_kv = new_v
+                        bus.name = new_name
+                        st.success("Updated")
                     
         elif comp_type == "Line":
-            lines = {f"Line {l.id} ({l.from_bus}->{l.to_bus})": l for l in model.lines}
-            selected_name = st.selectbox("Select Line", list(lines.keys()))
-            if selected_name:
-                line = lines[selected_name]
-                new_r = st.number_input("Resistance (Ohm)", 0.0, 100.0, line.r_ohm, format="%.4f")
-                new_x = st.number_input("Reactance (Ohm)", 0.0, 100.0, line.x_ohm, format="%.4f")
-                if st.button("Update Line"):
-                    line.r_ohm = new_r
-                    line.x_ohm = new_x
-                    st.success("Updated")
+            if not model.lines:
+                st.info("No lines available yet. Load or create a circuit to edit lines.")
+            else:
+                lines = {f"Line {l.id} ({l.from_bus}->{l.to_bus})": l for l in model.lines}
+                selected_name = st.selectbox("Select Line", list(lines.keys()))
+                if selected_name:
+                    line = lines[selected_name]
+                    new_r = st.number_input("Resistance (Ohm)", 0.0, 100.0, line.r_ohm, format="%.4f")
+                    new_x = st.number_input("Reactance (Ohm)", 0.0, 100.0, line.x_ohm, format="%.4f")
+                    if st.button("Update Line"):
+                        line.r_ohm = new_r
+                        line.x_ohm = new_x
+                        st.success("Updated")
+                        
+        elif comp_type == "Generator":
+            if not model.generators:
+                st.info("No generators available yet. Load or create a circuit to edit generators.")
+            else:
+                generators = {f"Gen {g.id} (Bus {g.bus_id})": g for g in model.generators}
+                selected_name = st.selectbox("Select Generator", list(generators.keys()))
+                if selected_name:
+                    generator = generators[selected_name]
+                    new_p = st.number_input("Power Output (MW)", 0.0, 1000.0, generator.p_mw)
+                    new_pmax = st.number_input("Max Power (MW)", 0.0, 2000.0, generator.p_max_mw)
+                    if st.button("Update Generator"):
+                        generator.p_mw = new_p
+                        generator.p_max_mw = new_pmax
+                        st.success("Updated")
+                        
+        elif comp_type == "Load":
+            if not model.loads:
+                st.info("No loads available yet. Load or create a circuit to edit loads.")
+            else:
+                loads = {f"Load {l.id} (Bus {l.bus_id})": l for l in model.loads}
+                selected_name = st.selectbox("Select Load", list(loads.keys()))
+                if selected_name:
+                    load = loads[selected_name]
+                    new_p = st.number_input("Demand (MW)", 0.0, 1000.0, load.p_mw)
+                    if st.button("Update Load"):
+                        load.p_mw = new_p
+                        st.success("Updated")
 
     # Visualization
     st.markdown("### Circuit Diagram")
@@ -886,6 +1051,217 @@ def render_circuit_designer():
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No circuit loaded. Load a file or create from scratch.")
+
+def render_component_telemetry(title: str, series_by_node: Dict[str, List[Dict[str, Any]]]):
+    """Render per-component telemetry graphs."""
+    st.markdown(f"### {title}")
+    if not series_by_node:
+        st.info("No component telemetry available yet.")
+        return
+
+    for node_id, series in series_by_node.items():
+        if not series:
+            continue
+        times = [entry["time"] for entry in series]
+        voltages = [entry["voltage"] for entry in series]
+        currents = [entry["current"] for entry in series]
+        powers = [entry["power"] for entry in series]
+        transients = [entry for entry in series if entry.get("transient")]
+
+        with st.expander(f"Component {node_id}", expanded=False):
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=times, y=voltages, name="Voltage (V)", line=dict(color="#4CAF50")))
+            fig.add_trace(go.Scatter(x=times, y=currents, name="Current (A)", line=dict(color="#FFA726")))
+            fig.add_trace(go.Scatter(x=times, y=powers, name="Power (W)", line=dict(color="#00CC96")))
+
+            if transients:
+                fig.add_trace(go.Scatter(
+                    x=[entry["time"] for entry in transients],
+                    y=[entry["voltage"] for entry in transients],
+                    mode="markers",
+                    marker=dict(color="#e94560", size=8),
+                    name="Transient"
+                ))
+
+            fig.update_layout(
+                height=280,
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                xaxis=dict(gridcolor='rgba(255,255,255,0.1)'),
+                yaxis=dict(gridcolor='rgba(255,255,255,0.1)')
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+def render_live_fault_graphs():
+    """Render immediate fault visibility graphs in the Unified Grid view."""
+    st.markdown("### 📉 Live Fault Graphs")
+
+    if not st.session_state.system_running:
+        st.info("Start the system to see live fault graphs.")
+        return
+
+    # Graph 1: Main sensor stream (same signal path used by detection chain)
+    if st.session_state.voltage_history:
+        recent = st.session_state.voltage_history[-250:]
+        base_time = recent[0]["time"]
+        t = [entry["time"] - base_time for entry in recent]
+        v = [entry["voltage"] for entry in recent]
+
+        fig_sensor = go.Figure()
+        fig_sensor.add_trace(go.Scatter(
+            x=t,
+            y=v,
+            mode="lines",
+            name="Sensor Voltage",
+            line=dict(color="#00CC96", width=2)
+        ))
+
+        fault_info = st.session_state.emulator.get_fault_info() if st.session_state.emulator else {}
+        if fault_info.get("active"):
+            fig_sensor.add_hline(
+                y=np.mean(v),
+                line_dash="dash",
+                line_color="#e94560",
+                annotation_text=f"FAULT ACTIVE: {fault_info.get('type', 'UNKNOWN')}"
+            )
+
+        fig_sensor.update_layout(
+            height=280,
+            xaxis_title="Time (s)",
+            yaxis_title="Voltage (V)",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(gridcolor='rgba(255,255,255,0.1)'),
+            yaxis=dict(gridcolor='rgba(255,255,255,0.1)')
+        )
+        st.plotly_chart(fig_sensor, use_container_width=True)
+    else:
+        st.info("Waiting for sensor samples. Start the system and inject a fault.")
+
+    # Graph 2: Per-node waveforms from emulator history for fault localization context
+    if st.session_state.emulator:
+        topology = st.session_state.emulator.get_topology()
+        nodes = list(topology.get("nodes", {}).keys())
+        if nodes:
+            selected_nodes = st.multiselect(
+                "Nodes to visualize",
+                options=nodes,
+                default=nodes[:min(3, len(nodes))],
+                key="live_fault_nodes"
+            )
+
+            if selected_nodes:
+                fig_nodes = go.Figure()
+                for node_id in selected_nodes:
+                    history = st.session_state.emulator.get_history(node_id)
+                    if len(history) == 0:
+                        continue
+                    downsampled = history[::100]
+                    tx = np.arange(len(downsampled)) / (st.session_state.emulator.sample_rate / 100.0)
+                    fig_nodes.add_trace(go.Scatter(
+                        x=tx,
+                        y=downsampled,
+                        mode="lines",
+                        name=f"Node {node_id}"
+                    ))
+
+                fig_nodes.update_layout(
+                    height=320,
+                    xaxis_title="Window Time (s)",
+                    yaxis_title="Voltage (V)",
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    xaxis=dict(gridcolor='rgba(255,255,255,0.1)'),
+                    yaxis=dict(gridcolor='rgba(255,255,255,0.1)')
+                )
+                st.plotly_chart(fig_nodes, use_container_width=True)
+
+def render_unified_grid():
+    """Render unified digital twin and circuit design view."""
+    st.markdown("## 🧩 Unified Grid: Digital Twin & Circuit Model")
+
+    twin_tab, circuit_tab, telemetry_tab = st.tabs(
+        ["Digital Twin", "Circuit Designer", "Component Telemetry"]
+    )
+
+    with twin_tab:
+        render_digital_twin()
+        render_live_fault_graphs()
+
+        st.markdown("### 🧭 Fault Trace")
+        if st.session_state.fault_location:
+            trace = format_fault_trace(st.session_state.circuit_model, st.session_state.fault_location)
+            fault_info = st.session_state.emulator.get_fault_info() if st.session_state.emulator else {}
+            if fault_info.get("active"):
+                st.markdown(
+                    f"**Fault Type:** {fault_info.get('type')}  \n"
+                    f"**Severity:** {fault_info.get('severity', 0.0):.2f}  \n"
+                    f"**Location Node:** {fault_info.get('location')}"
+                )
+
+            details = st.session_state.fault_location.get("details", {})
+            energy_ratio = details.get("energy_ratio")
+            if energy_ratio is not None:
+                st.markdown(
+                    f"**Wavelet Energy Ratio (D1/D2):** {energy_ratio:.2f}  \n"
+                    "Higher ratios indicate closer, sharper transients; lower ratios imply attenuation over distance."
+                )
+
+            st.markdown(
+                f"**Estimated Distance:** {trace.get('distance_m', 0.0):.1f} m  \n"
+                f"**Zone:** {trace.get('zone', 'UNKNOWN')}  \n"
+                f"**Confidence:** {trace.get('confidence', 0.0):.2f}"
+            )
+            if trace.get("line"):
+                line = trace["line"]
+                st.markdown(
+                    f"**Mapped Line:** Line {line['id']} (Bus {line['from_bus']} → Bus {line['to_bus']})  \n"
+                    f"**Offset Along Line:** {line['offset_m']:.1f} m (Line length ~{line['length']:.1f} m)"
+                )
+            st.info(trace.get("explanation"))
+        else:
+            st.info("Run a fault simulation to see the exact circuit trace.")
+
+    with circuit_tab:
+        render_circuit_designer()
+
+    with telemetry_tab:
+        st.markdown("### ⏺️ Recording & Replay")
+        controls = st.columns([1, 1, 1])
+        with controls[0]:
+            if st.button("Start Recording", width='stretch', disabled=st.session_state.recording_enabled):
+                st.session_state.recording_enabled = True
+                st.session_state.recording_data = {}
+        with controls[1]:
+            if st.button("Stop Recording", width='stretch', disabled=not st.session_state.recording_enabled):
+                st.session_state.recording_enabled = False
+                if st.session_state.recording_data:
+                    recording = {
+                        "name": datetime.now().strftime("Recording %H:%M:%S"),
+                        "data": st.session_state.recording_data.copy()
+                    }
+                    st.session_state.recordings.append(recording)
+                    st.session_state.recording_data = {}
+        with controls[2]:
+            if st.button("Clear Recordings", width='stretch'):
+                st.session_state.recordings = []
+                st.session_state.recording_data = {}
+
+        if st.session_state.recordings:
+            recording_names = [rec["name"] for rec in st.session_state.recordings]
+            selected_name = st.selectbox("Replay Session", recording_names)
+            st.session_state.selected_recording = selected_name
+            st.session_state.replay_mode = st.toggle("Replay Mode", value=st.session_state.replay_mode)
+
+        if st.session_state.replay_mode and st.session_state.selected_recording:
+            selected = next(
+                (rec for rec in st.session_state.recordings if rec["name"] == st.session_state.selected_recording),
+                None
+            )
+            if selected:
+                render_component_telemetry("Recorded Component Telemetry", selected["data"])
+        else:
+            render_component_telemetry("Live Component Telemetry", st.session_state.component_history)
 
 def render_wavelet_inspector():
     """Render the wavelet analysis inspector."""
@@ -1334,14 +1710,13 @@ def main():
     
     # Process events
     process_events()
+    update_component_history()
     
     # Render selected page
     if page == "Dashboard":
         render_dashboard()
-    elif page == "Digital Twin":
-        render_digital_twin()
-    elif page == "Circuit Designer":
-        render_circuit_designer()
+    elif page == "Unified Grid":
+        render_unified_grid()
     elif page == "Wavelet Inspector":
         render_wavelet_inspector()
     elif page == "Fault Timeline":
