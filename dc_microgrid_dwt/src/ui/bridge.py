@@ -5,15 +5,23 @@ from src.domain.events import VoltageSampleEvent, ProcessingResultEvent, SystemT
 class BridgeAgent(BaseAgent):
     def setup(self):
         self.queue = queue.Queue()
-        self.subscribe(VoltageSampleEvent, self.on_event)
+        self.downsample_factor = self.config.get('downsample_factor', 20) # Default to skip 95% of events (for 10kHz -> 500Hz UI)
+        self.counter = 0
+
+        self.subscribe(VoltageSampleEvent, self.on_voltage)
         self.subscribe(ProcessingResultEvent, self.on_event)
         self.subscribe(SystemTripEvent, self.on_trip)
         # self.subscribe(DWTCoefficientsEvent, self.on_event) # High throughput, be careful
 
+    def on_voltage(self, event: VoltageSampleEvent):
+        """Handle high-frequency voltage events with downsampling."""
+        self.counter += 1
+        if self.counter % self.downsample_factor == 0:
+            self.queue.put(event)
+
     def on_event(self, event):
         # We might need to downsample or filter to avoid flooding the UI
-        # For VoltageSampleEvent, maybe only send every Nth sample or batches?
-        # For now, push everything, but Streamlit loop will need to drain fast.
+        # For ordinary events, push everything
         self.queue.put(event)
 
     def on_trip(self, event: SystemTripEvent):

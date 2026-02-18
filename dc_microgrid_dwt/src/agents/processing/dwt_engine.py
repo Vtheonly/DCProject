@@ -31,10 +31,18 @@ class DWTEngineAgent(BaseAgent):
     def setup(self):
         """Initialize DWT engine with configuration."""
         # Get settings from config
+        # Handle both nested dict (original design) and flat string (system.py usage)
         wavelet_config = self.config.get('wavelet', {})
-        self.wavelet_name = wavelet_config.get('family', 'db4')
-        self.level = wavelet_config.get('level', 4)
-        self.mode = wavelet_config.get('mode', 'symmetric')
+        
+        if isinstance(wavelet_config, str):
+            self.wavelet_name = wavelet_config
+            # Look for level/mode in top-level config
+            self.level = self.config.get('level', 4)
+            self.mode = self.config.get('mode', 'symmetric')
+        else:
+            self.wavelet_name = wavelet_config.get('family', 'db4')
+            self.level = wavelet_config.get('level', 4)
+            self.mode = wavelet_config.get('mode', 'symmetric')
         
         # Validate wavelet
         if self.wavelet_name not in pywt.wavelist():

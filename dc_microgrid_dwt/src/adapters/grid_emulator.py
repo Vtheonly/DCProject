@@ -218,8 +218,8 @@ class GridEmulator(IGridEmulator, ISensor):
                             elif node_id in ["4", "5"]: dist_to_fault = 300
                             elif node_id == "6": dist_to_fault = 400
                             
-                    # Apply fault effect with specific distance
-                    v = self._apply_fault_to_voltage(v, t, dist_to_fault)
+                    # Apply fault effect with distance-based attenuation (ALL fault types)
+                    v = self._apply_fault_effect(v, t, distance_m=dist_to_fault)
                 
                 # Update Node State
                 node.voltage = v
@@ -230,36 +230,6 @@ class GridEmulator(IGridEmulator, ISensor):
                 self.history[node_id][idx] = v
                 self.history_idx = idx
 
-    def _apply_fault_to_voltage(self, voltage: float, t: float, distance_m: float) -> float:
-        """Apply fault physics to a voltage signal based on distance."""
-        elapsed = time.time() - self.fault_config.start_time
-        sev = self.fault_config.severity
-        ft = self.fault_config.fault_type
-        
-        # Attenuation based on distance
-        attenuation = 1.0 / (1.0 + (distance_m / 100.0))
-        
-        if ft == FaultType.LINE_TO_LINE:
-            # 60% dip at source, damped oscillation
-            dip = 0.6 * sev * attenuation
-            voltage *= (1.0 - dip)
-            
-            freq = 5000 
-            damping = np.exp(-elapsed * 50)
-            transient = sev * 100 * np.sin(2 * np.pi * freq * t) * damping * attenuation
-            voltage += transient
-            
-        elif ft == FaultType.LINE_TO_GROUND:
-             # 40% dip
-            dip = 0.4 * sev * attenuation
-            voltage *= (1.0 - dip)
-            
-            freq = 1000
-            damping = np.exp(-elapsed * 20)
-            transient = sev * 80 * np.sin(2 * np.pi * freq * t) * damping * attenuation
-            voltage += transient
-            
-        return voltage
         
     def get_history(self, node_id: str) -> np.ndarray:
         """Get ordered history buffer for a node."""
@@ -350,19 +320,25 @@ class GridEmulator(IGridEmulator, ISensor):
         """Read voltage samples."""
         return [self.read() for _ in range(count)]
 
-    def _apply_fault_effect(self, voltage: float, t: float) -> float:
-        """Apply fault effects to voltage based on active fault config."""
+    def _apply_fault_effect(self, voltage: float, t: float, distance_m: float = None) -> float:
+        """Apply fault effects to voltage based on active fault config.
+        
+        Args:
+            voltage: Current voltage value
+            t: Time within simulation step
+            distance_m: Distance from fault to measurement point (meters).
+                        If None, falls back to fault config properties.
+        """
         elapsed = time.time() - self.fault_config.start_time
         sev = self.fault_config.severity
         ft = self.fault_config.fault_type
         
-        # Get distance factor (default 10m if not specified)
-        props = self.fault_config.properties or {}
-        distance_m = props.get("distance", 10.0)
+        # Get distance factor
+        if distance_m is None:
+            props = self.fault_config.properties or {}
+            distance_m = props.get("distance", 10.0)
         
         # Physics: High frequencies attenuate over distance
-        # Simple simulation: Reduce transient amplitude based on distance
-        # normalized to some reference (e.g., 100m)
         attenuation = 1.0 / (1.0 + (distance_m / 100.0))
         
         if ft == FaultType.LINE_TO_LINE:

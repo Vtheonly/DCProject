@@ -55,6 +55,7 @@ class Observability:
     
     def __init__(self):
         self._metrics: Dict[str, Any] = {}
+        self.log_buffer_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         self._setup_logging()
 
     @classmethod
@@ -96,11 +97,7 @@ class Observability:
         """Retrieve all buffered logs as a single string."""
         return "\n".join(self.log_buffer)
 
-    def __init__(self):
-        self._metrics: Dict[str, Any] = {}
-        import collections
-        self.log_buffer_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        self._setup_logging()
+
 
     def log_metric(self, name: str, value: Any, agent: str = "System"):
         """Track a system metric."""

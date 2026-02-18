@@ -1,0 +1,49 @@
+# CMakeLists.txt - OPTIMIZED VERSION
+# Copy this file to: cpp/CMakeLists.txt
+#
+# KEY OPTIMIZATIONS:
+# 1. -O3 with -march=native for maximum performance
+# 2. -funroll-loops for DSP loop optimization
+# 3. -ffast-math for faster floating-point operations
+# 4. Link-Time Optimization (LTO) for cross-module optimization
+
+cmake_minimum_required(VERSION 3.14)
+project(microgrid_dsp CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Maximum optimization flags for DSP performance
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG -funroll-loops -ffast-math")
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-s")
+
+# Enable Link-Time Optimization for cross-module optimization
+include(CheckIPOSupported)
+check_ipo_supported(RESULT lto_supported OUTPUT lto_output)
+if(lto_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    message(STATUS "LTO enabled for maximum optimization")
+else()
+    message(STATUS "LTO not supported: ${lto_output}")
+endif()
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Find pybind11
+find_package(pybind11 REQUIRED)
+
+# Build the Python module
+pybind11_add_module(microgrid_dsp
+    dsp_core.cpp
+    bindings.cpp
+)
+
+target_include_directories(microgrid_dsp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Install to the project root so Python can import it
+install(TARGETS microgrid_dsp
+    LIBRARY DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
