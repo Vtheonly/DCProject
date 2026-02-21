@@ -458,3 +458,57 @@ def get_node_histories() -> dict:
         for node_id in emulator.history:
             result[node_id] = emulator.get_history(node_id)
     return result
+
+
+def update_component_history():
+    """Record latest per-component telemetry for visualization and replay."""
+    emulator = st.session_state.get("emulator")
+    if not emulator:
+        return
+
+    now = time.time()
+    last_update = st.session_state.get("last_telemetry_update", 0.0)
+    if now - last_update < 0.2:
+        return
+    st.session_state.last_telemetry_update = now
+
+    topology = emulator.get_topology() if hasattr(emulator, "get_topology") else {}
+    nodes = topology.get("nodes", {})
+    timestamp = now
+
+    history = st.session_state.get("component_history", {})
+    for node_id, node in nodes.items():
+        voltage = float(getattr(node, "voltage", 0.0) or 0.0)
+        power = float(getattr(node, "power", 0.0) or 0.0)
+        current = voltage / 40.0 if voltage else 0.0
+        
+        entry = {
+            "time": timestamp,
+            "voltage": voltage,
+            "current": current,
+            "power": power,
+            "status": getattr(node, "status", ""),
+        }
+        
+        previous = history.get(node_id, [])[-1] if history.get(node_id) else None
+        entry["transient"] = _detect_transient(previous, entry)
+        history.setdefault(node_id, []).append(entry)
+
+        if len(history[node_id]) > 500:
+            history[node_id] = history[node_id][-500:]
+
+        if st.session_state.get("recording_enabled"):
+            recording_data = st.session_state.get("recording_data", {})
+            recording_data.setdefault(node_id, []).append(entry.copy())
+            st.session_state.recording_data = recording_data
+
+    st.session_state.component_history = history
+
+
+def _detect_transient(previous: dict, current: dict) -> bool:
+    """Detect transient events based on sudden deltas."""
+    if not previous:
+        return False
+    delta_v = abs(current["voltage"] - previous["voltage"])
+    delta_i = abs(current["current"] - previous["current"])
+    return delta_v > 20.0 or delta_i > 5.0

@@ -11,6 +11,7 @@ from src.ui.views.circuit_designer import render_circuit_designer
 from src.ui.views.system_health import render_system_health
 from src.ui.views.reports import render_reports
 from src.ui.views.system_log import render_system_log
+from src.ui.views.unified_grid import render_unified_grid
 
 __all__ = [
     "render_dashboard",
@@ -21,4 +22,5 @@ __all__ = [
     "render_system_health",
     "render_reports",
     "render_system_log",
+    "render_unified_grid",
 ]

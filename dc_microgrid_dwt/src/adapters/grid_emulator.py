@@ -139,7 +139,10 @@ class GridEmulator(IGridEmulator, ISensor):
             logger.info(f"Loaded circuit '{circuit.name}' with {len(circuit.buses)} buses into Emulator.")
         
         # Active node for voltage reading
-        self.active_node = "BUS_DC"
+        if circuit.buses:
+            self.active_node = str(circuit.buses[0].id)
+        else:
+            self.active_node = "1"
         
     def _init_default_topology(self):
         """Initialize default grid topology for Digital Twin."""

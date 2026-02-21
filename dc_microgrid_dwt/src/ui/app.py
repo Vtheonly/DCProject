@@ -18,13 +18,13 @@ if project_root not in sys.path:
 from src.ui.state import init_session_state
 from src.ui.styles import get_custom_css
 from src.ui.sidebar import render_sidebar
-from src.ui.system import process_events
+from src.ui.system import process_events, update_component_history
 
 # Import page renderers
 from src.ui.views import (
     render_dashboard, render_digital_twin, render_wavelet_inspector,
     render_fault_analysis, render_circuit_designer, render_system_health,
-    render_reports, render_system_log
+    render_reports, render_system_log, render_unified_grid
 )
 
 
@@ -45,15 +45,16 @@ def main():
 
     # 4. Process Background Events (Bridge -> UI State)
     process_events()
+    update_component_history()
 
-    # 5. Render Sidebar
-    render_sidebar()
+    # 5. Render Sidebar and get selected page
+    page = render_sidebar()
 
     # 6. Routing & Rendering
-    page = st.session_state.current_page
-
     if page == "Dashboard":
         render_dashboard()
+    elif page == "Unified Grid":
+        render_unified_grid()
     elif page == "Digital Twin":
         render_digital_twin()
     elif page == "Wavelet Inspector":
@@ -84,5 +85,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import time
     main()
