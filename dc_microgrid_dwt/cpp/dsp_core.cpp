@@ -345,13 +345,18 @@ DSPResult DSPPipeline::process_sample(double raw_voltage) {
         // Get the current window
         auto window = sample_buffer_.get_window(dsp_cfg_.window_size);
 
-        // Run DWT
+        // Run DWT OUTSIDE the mutex — this is the most expensive operation
+        // and only reads from `window` (local copy), so it's thread-safe.
+        auto coefficients = dwt_.transform(window);
+
+        // Store coefficients under the lock (fast pointer swap)
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            last_coefficients_ = dwt_.transform(window);
+            last_coefficients_ = std::move(coefficients);
         }
 
-        // Step 5: Compute energy
+        // Step 5: Compute energy (reads last_coefficients_ but we still
+        // hold the only reference since we just moved it in)
         result.energy_levels = dwt_.compute_energy(last_coefficients_);
         result.d1_peak = dwt_.find_d1_peak(last_coefficients_);
 
@@ -360,13 +365,15 @@ DSPResult DSPPipeline::process_sample(double raw_voltage) {
         result.high_freq_ratio = (result.total_energy > 0.001)
             ? result.energy_levels[0] / result.total_energy : 0.0;
 
-        // Store energy history for visualization
+        // Store energy history using ring buffer (O(1) instead of O(n) erase)
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            energy_history_.push_back(result.energy_levels);
-            if (energy_history_.size() > energy_history_max_) {
-                energy_history_.erase(energy_history_.begin());
+            if (energy_history_.size() < energy_history_max_) {
+                energy_history_.push_back(result.energy_levels);
+            } else {
+                energy_history_[energy_history_write_idx_] = result.energy_levels;
             }
+            energy_history_write_idx_ = (energy_history_write_idx_ + 1) % energy_history_max_;
         }
 
         // Step 6: Fast trip check
@@ -378,7 +385,9 @@ DSPResult DSPPipeline::process_sample(double raw_voltage) {
         // Between DWT runs, carry forward last energy
         std::lock_guard<std::mutex> lock(mutex_);
         if (!energy_history_.empty()) {
-            result.energy_levels = energy_history_.back();
+            // Read from the most recent entry in the ring buffer
+            size_t last = (energy_history_write_idx_ + energy_history_.size() - 1) % energy_history_.size();
+            result.energy_levels = energy_history_[last];
         }
     }
 
@@ -433,6 +442,7 @@ void DSPPipeline::reset() {
     trip_count_ = 0;
     total_processing_us_ = 0;
     stride_counter_ = 0;
+    energy_history_write_idx_ = 0;
 }
 
 double DSPPipeline::avg_processing_us() const {

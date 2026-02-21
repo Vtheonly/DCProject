@@ -1,0 +1,19 @@
+{
+  "trip_event": {
+    "type": "SystemTripEvent",
+    "timestamp": 1771457291.9900334,
+    "source": "HighSpeedLoop",
+    "event_id": "37c23713-48bb-4c6d-89fe-c5d19a02d8a4",
+    "payload": null,
+    "reason": "Fast Trip (DSP Core) \u2014 D1 energy=5743.0",
+    "urgency": 10,
+    "latency_ms": 0.0,
+    "snapshot_data": {}
+  },
+  "fault_start": null,
+  "trip_time": 1771457291.9900334,
+  "latency_ms": null,
+  "recorded_at": "2026-02-19T00:28:11.990755",
+  "event_count": 0,
+  "events": []
+}

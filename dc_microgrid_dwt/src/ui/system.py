@@ -47,6 +47,7 @@ from src.agents.supervision.ai_classifier import AIClassifierAgent
 from src.agents.supervision.replay_recorder import ReplayRecorderAgent
 from src.agents.supervision.report_generator import ReportGeneratorAgent
 from src.ui.bridge import BridgeAgent
+from src.adapters.high_speed_loop import HighSpeedDetectionLoop
 
 
 # Try to import C++ DSP module
@@ -153,21 +154,42 @@ def start_system():
                 st.session_state.dsp_available = False
 
         # 4. Create all agents
-        # 4. Create all agents
         # Increase sample rate to 10kHz for high-speed detection
         sampler = SamplerAgent("Sampler", bus, config={"sample_rate": 10000})
         sampler.set_sensor(sensor)
 
         # Create DSP Runner if pipeline is available
         dsp_runner = None
+        high_speed_loop = None
         if dsp_pipeline:
             dsp_runner = DSPRunnerAgent("DSPRunner", bus, config={"dsp_pipeline": dsp_pipeline})
+            add_log("Using C++ DSP Fast Path — Python DWT agents disabled", "INFO")
 
-        window_mgr = WindowManagerAgent("WindowManager", bus, config={"window_size": 128})
-        dwt_engine = DWTEngineAgent("DWTEngine", bus, config={
-            "wavelet": "db4", "level": 4, "mode": "symmetric"
-        })
-        detail_analyzer = DetailAnalyzerAgent("DetailAnalyzer", bus)
+            # Start High-Speed Detection Loop (bypasses EventBus)
+            try:
+                high_speed_loop = HighSpeedDetectionLoop(
+                    sensor, dsp_pipeline, bus,
+                    sample_rate=20000, ui_throttle=100,
+                )
+                high_speed_loop.start()
+                add_log("HighSpeedDetectionLoop active @ 20 kHz", "INFO")
+            except Exception as e:
+                add_log(f"HighSpeedDetectionLoop failed: {e}", "WARNING")
+                high_speed_loop = None
+        else:
+            add_log("Using Python DSP Fallback (C++ unavailable)", "WARNING")
+
+        # Python DWT chain — only when C++ DSP is NOT available
+        window_mgr = None
+        dwt_engine = None
+        detail_analyzer = None
+        if not dsp_pipeline:
+            window_mgr = WindowManagerAgent("WindowManager", bus, config={"window_size": 128})
+            dwt_engine = DWTEngineAgent("DWTEngine", bus, config={
+                "wavelet": "db4", "level": 4, "mode": "symmetric"
+            })
+            detail_analyzer = DetailAnalyzerAgent("DetailAnalyzer", bus)
+
         fault_locator = PreciseFaultLocatorAgent("FaultLocator", bus)
         fault_locator.emulator = emulator
 
@@ -187,18 +209,20 @@ def start_system():
         replay_recorder = ReplayRecorderAgent("ReplayRecorder", bus)
         report_generator = ReportGeneratorAgent("ReportGenerator", bus)
 
-        # 5. Create UI bridge agent
         # 5. Create UI bridge agent (downsample 50x to 200Hz)
         bridge = BridgeAgent("UIBridge", bus, config={"downsample_factor": 50})
 
         # 6. Register all agents
         agents = [
-            sampler, window_mgr, dwt_engine, detail_analyzer, fault_locator,
+            sampler, fault_locator,
             threshold_guard, energy_monitor, fault_voter,
             trip_sequencer, zeta_logic,
             health_monitor, ai_classifier, replay_recorder, report_generator,
             bridge
         ]
+        # Add Python DWT agents only if C++ is NOT available
+        if window_mgr:
+            agents.extend([window_mgr, dwt_engine, detail_analyzer])
         for agent in agents:
             registry.register(agent)
             
@@ -226,9 +250,11 @@ def start_system():
         st.session_state.registry = registry
         st.session_state.emulator = emulator
         st.session_state.bridge_agent = bridge
+        st.session_state.high_speed_loop = high_speed_loop
         st.session_state.system_running = True
 
-        add_log("✅ System started successfully!", "INFO")
+        dsp_label = "C++ DSP" if dsp_pipeline else "Python Fallback"
+        add_log(f"✅ System started successfully! (DSP: {dsp_label})", "INFO")
 
     except Exception as e:
         add_log(f"❌ Failed to start system: {e}", "ERROR")
@@ -243,6 +269,12 @@ def stop_system():
     add_log("Stopping system...", "INFO")
 
     try:
+        # Stop high-speed loop FIRST (it touches the sensor & pipeline)
+        hsl = st.session_state.get("high_speed_loop")
+        if hsl is not None:
+            hsl.stop()
+            st.session_state.high_speed_loop = None
+
         if st.session_state.registry:
             st.session_state.registry.stop_all()
         if st.session_state.emulator:

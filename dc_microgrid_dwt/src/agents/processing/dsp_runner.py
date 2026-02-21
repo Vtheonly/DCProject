@@ -31,7 +31,7 @@ class DSPRunnerAgent(BaseAgent):
             result = self.pipeline.process_sample(event.voltage)
             
             # 1. Fast Trip Logic
-            if result.trip:
+            if result.trip.triggered:
                 trip_event = SystemTripEvent(
                     reason="Fast Trip (DSP Core)",
                     source=self.name,
@@ -46,9 +46,9 @@ class DSPRunnerAgent(BaseAgent):
                 
                 # Create result event for UI/Logging
                 res_event = ProcessingResultEvent(
-                    d1_peak=0.0, # Peak detection logic inside DSP if needed
+                    d1_peak=result.d1_peak,
                     d1_energy=energy.get("D1", 0.0),
-                    is_faulty=result.trip,
+                    is_faulty=result.trip.triggered,
                     timestamp=event.timestamp
                 )
                 # Attach full energy spectrum for dashboard

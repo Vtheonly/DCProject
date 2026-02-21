@@ -21,7 +21,7 @@ from src.ui.sidebar import render_sidebar
 from src.ui.system import process_events
 
 # Import page renderers
-from src.ui.pages import (
+from src.ui.views import (
     render_dashboard, render_digital_twin, render_wavelet_inspector,
     render_fault_analysis, render_circuit_designer, render_system_health,
     render_reports, render_system_log
@@ -74,7 +74,12 @@ def main():
     # 7. Auto-refresh for real-time feel
     # Rerun every 100ms if system is running to pull new events
     if st.session_state.system_running:
-        time.sleep(0.05)  # Slight delay to prevent CPU hogging
+        # Smart throttle: fast refresh only when events are pending
+        bridge = st.session_state.get("bridge_agent")
+        if bridge and not bridge.get_queue().empty():
+            time.sleep(0.05)  # Events pending — refresh quickly
+        else:
+            time.sleep(0.2)   # Idle — conserve CPU
         st.rerun()
 
 

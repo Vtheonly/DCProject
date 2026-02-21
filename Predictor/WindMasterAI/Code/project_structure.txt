@@ -1,0 +1,16 @@
+content/wind_master_system/config/__init__.py
+content/wind_master_system/data/processed/__init__.py
+content/wind_master_system/data/raw/__init__.py
+content/wind_master_system/logs/__init__.py
+content/wind_master_system/reports/__init__.py
+content/wind_master_system/src/core/__init__.py
+content/wind_master_system/src/ingestion/__init__.py
+content/wind_master_system/src/modeling/__init__.py
+content/wind_master_system/src/processing/__init__.py
+content/wind_master_system/src/utils/__init__.py
+content/wind_master_system/src/core/schema.py
+content/wind_master_system/src/ingestion/adapters.py
+content/wind_master_system/src/modeling/predictor.py
+content/wind_master_system/src/processing/physics.py
+content/wind_master_system/src/utils/logger.py
+content/wind_master_system/main.py

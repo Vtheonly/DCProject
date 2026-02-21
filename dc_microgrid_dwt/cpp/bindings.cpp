@@ -162,6 +162,22 @@ PYBIND11_MODULE(microgrid_dsp, m) {
             Call this at your sample rate (e.g., 20kHz).
             )doc")
 
+        .def("process_batch", [](microgrid::DSPPipeline& p, py::array_t<double> arr) {
+            auto buf = arr.unchecked<1>();
+            py::list results;
+            for (ssize_t i = 0; i < buf.shape(0); ++i) {
+                results.append(p.process_sample(buf(i)));
+            }
+            return results;
+        },
+            py::arg("samples"),
+            R"doc(
+            Process a batch of ADC samples through the pipeline.
+
+            Reduces Python/C++ boundary crossings from N to 1.
+            Returns a list of DSPResult objects.
+            )doc")
+
         .def("get_coefficients", &microgrid::DSPPipeline::get_coefficients,
             "Get DWT coefficient arrays from last transform [A4, D4, D3, D2, D1].")
 

@@ -274,6 +274,7 @@ private:
     std::vector<std::vector<double>> last_coefficients_;
     std::vector<std::array<double, 5>> energy_history_;
     size_t energy_history_max_ = 500;
+    size_t energy_history_write_idx_ = 0;  // Ring buffer write position
 
     // Counters
     int64_t sample_count_ = 0;
